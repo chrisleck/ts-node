@@ -1,5 +1,5 @@
 import { relative, basename, extname, resolve, dirname, join } from 'path'
-import { readdirSync, writeFileSync, readFileSync, statSync } from 'fs'
+import fs = require('fs-ext')
 import { EOL, tmpdir, homedir } from 'os'
 import sourceMapSupport = require('source-map-support')
 import mkdirp = require('mkdirp')
@@ -47,6 +47,7 @@ export interface Options {
   fast?: boolean | null
   cache?: boolean | null
   cacheDirectory?: string
+  cacheLocking?: boolean
   compiler?: string
   project?: boolean | string
   ignore?: boolean | string | string[]
@@ -82,6 +83,7 @@ const DEFAULTS = {
   fileExists,
   cache: yn(process.env['TS_NODE_CACHE'], { default: true }),
   cacheDirectory: process.env['TS_NODE_CACHE_DIRECTORY'],
+  cacheLocking: yn(process.env['TS_NODE_CACHE_LOCKING']),
   disableWarnings: yn(process.env['TS_NODE_DISABLE_WARNINGS']),
   compiler: process.env['TS_NODE_COMPILER'],
   compilerOptions: parse(process.env['TS_NODE_COMPILER_OPTIONS']),
@@ -146,6 +148,7 @@ export function register (options: Options = {}): Register {
   const fast = !!(options.fast == null ? DEFAULTS.fast : options.fast)
   const project = options.project || DEFAULTS.project
   const cacheDirectory = options.cacheDirectory || DEFAULTS.cacheDirectory || getTmpDir()
+  const cacheLocking = options.cacheLocking || DEFAULTS.cacheLocking
   const compilerOptions = Object.assign({}, DEFAULTS.compilerOptions, options.compilerOptions)
   const originalJsHandler = require.extensions['.js']
 
@@ -154,6 +157,9 @@ export function register (options: Options = {}): Register {
     versions: Object.create(null),
     outputs: Object.create(null)
   }
+
+  const getCacheFile = cacheLocking ? getFileWithSharedLock : getFile
+  const writeCacheFile = cacheLocking ? writeFileWithExclusiveLock : writeFile
 
   const ignore = arrify(
     (
@@ -236,7 +242,8 @@ export function register (options: Options = {}): Register {
   let compile = readThrough(
     cachedir,
     shouldCache,
-    getFile,
+    getCacheFile,
+    writeCacheFile,
     cache,
     getOutput,
     getExtension
@@ -264,7 +271,7 @@ export function register (options: Options = {}): Register {
             return undefined
           }
 
-          cache.contents[fileName] = getFile(fileName)
+          cache.contents[fileName] = getCacheFile(fileName)
         }
 
         return ts.ScriptSnapshot.fromString(cache.contents[fileName])
@@ -317,7 +324,8 @@ export function register (options: Options = {}): Register {
     compile = readThrough(
       cachedir,
       shouldCache,
-      getFile,
+      getCacheFile,
+      writeCacheFile,
       cache,
       function (code: string, fileName: string, lineOffset?: number) {
         setCache(code, fileName)
@@ -446,7 +454,8 @@ type SourceOutput = [string, string]
 function readThrough (
   cachedir: string,
   shouldCache: boolean,
-  getFile: (fileName: string) => string,
+  getCacheFile: (fileName: string) => string,
+  writeCacheFile: (fileName: string, output: string) => void,
   cache: Cache,
   compile: (code: string, fileName: string, lineOffset?: number) => SourceOutput,
   getExtension: (fileName: string) => string
@@ -471,7 +480,7 @@ function readThrough (
     const outputPath = `${cachePath}${extension}`
 
     try {
-      const output = getFile(outputPath)
+      const output = getCacheFile(outputPath)
       cache.outputs[fileName] = output
       return output
     } catch (err) {/* Ignore. */}
@@ -480,7 +489,7 @@ function readThrough (
     const output = updateOutput(value, fileName, sourceMap)
 
     cache.outputs[fileName] = output
-    writeFileSync(outputPath, output)
+    writeCacheFile(outputPath, output)
 
     return output
   }
@@ -530,7 +539,7 @@ function getCompilerDigest (opts: any) {
  */
 export function fileExists (fileName: string): boolean {
   try {
-    const stats = statSync(fileName)
+    const stats = fs.statSync(fileName)
 
     return stats.isFile() || stats.isFIFO()
   } catch (err) {
@@ -542,7 +551,7 @@ export function fileExists (fileName: string): boolean {
  * Get directories within a directory.
  */
 export function getDirectories (path: string): string[] {
-  return readdirSync(path).filter(name => directoryExists(join(path, name)))
+  return fs.readdirSync(path).filter(name => directoryExists(join(path, name)))
 }
 
 /**
@@ -550,7 +559,7 @@ export function getDirectories (path: string): string[] {
  */
 export function directoryExists (path: string): boolean {
   try {
-    return statSync(path).isDirectory()
+    return fs.statSync(path).isDirectory()
   } catch (err) {
     return false
   }
@@ -560,7 +569,37 @@ export function directoryExists (path: string): boolean {
  * Get the file from the file system.
  */
 export function getFile (fileName: string): string {
-  return readFileSync(fileName, 'utf8')
+  return fs.readFileSync(fileName, 'utf8')
+}
+
+export function getFileWithSharedLock (fileName: string): string {
+  let fileDescriptor = 0
+  try {
+    fileDescriptor = fs.openSync(fileName, 'r')
+    fs.flockSync(fileDescriptor, 'sh')
+    return fs.readFileSync(fileDescriptor, 'utf8')
+  } finally {
+    if (fileDescriptor) {
+      fs.closeSync(fileDescriptor)
+    }
+  }
+}
+
+export function writeFile (fileName: string, output: string): void {
+  fs.writeFileSync(fileName, output, { encoding: 'utf8'} )
+}
+
+export function writeFileWithExclusiveLock (fileName: string, output: string): void {
+  let fileDescriptor = 0
+  try {
+    fileDescriptor = fs.openSync(fileName, 'w')
+    fs.flockSync(fileDescriptor, 'ex')
+    fs.writeFileSync(fileDescriptor, output)
+  } finally {
+    if (fileDescriptor) {
+      fs.closeSync(fileDescriptor)
+    }
+  }
 }
 
 /**
